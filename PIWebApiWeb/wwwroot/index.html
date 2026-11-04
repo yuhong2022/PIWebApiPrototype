@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>PI Web API Prototype</title>
+<style>
+  body { font-family: Segoe UI, Arial, sans-serif; margin: 0; font-size: 14px; color: #222; }
+  header { background: #2b3a4a; color: #fff; padding: 8px 14px; display: flex; gap: 12px; align-items: center; }
+  header select, header button { padding: 3px 6px; }
+  header .spacer { flex: 1; }
+  #login { max-width: 320px; margin: 80px auto; display: grid; gap: 8px; }
+  #login input, #login button { padding: 6px; }
+  #login .err, #err { color: #c00; }
+  #main { display: flex; height: calc(100vh - 42px); }
+  #nav { width: 340px; min-width: 200px; overflow: auto; border-right: 1px solid #ccc; padding: 6px; resize: horizontal; }
+  #detail { flex: 1; overflow: auto; padding: 10px 16px; }
+  ul.tree { list-style: none; padding-left: 16px; margin: 0; }
+  #nav > ul.tree { padding-left: 0; }
+  .node { cursor: pointer; padding: 2px 4px; white-space: nowrap; border-radius: 3px; }
+  .node:hover { background: #eef3f8; }
+  .node.sel { background: #3d8bd9; color: #fff; }
+  .twisty { display: inline-block; width: 14px; color: #666; }
+  .folder::before { content: "\1F4C1 "; }
+  .leaf::before { content: "\1F539 "; }
+  table { border-collapse: collapse; width: 100%; }
+  td { padding: 4px 8px; border-bottom: 1px solid #eee; vertical-align: top; }
+  td.n { width: 220px; text-align: right; color: #555; }
+  td.v { font-weight: 500; }
+  td.u, td.t { color: #888; font-size: 12px; }
+  h3 { margin: 4px 0 10px; }
+  .hidden { display: none; }
+  #plotBox { margin-top: 18px; }
+  #plotBox .ctl { display: flex; gap: 8px; align-items: center; margin-bottom: 6px; }
+  #plotBox input { padding: 3px 6px; width: 110px; }
+  #plot { width: 100%; height: 260px; border: 1px solid #ddd; background: #fff; }
+  #plotMsg { color: #888; font-size: 12px; }
+</style>
+</head>
+<body>
+
+<div id="loginView">
+  <form id="login">
+    <h2>PI Web API</h2>
+    <input id="host" placeholder="PI Web API server" value="davm089">
+    <input id="domain" placeholder="Domain" value="darmstadt">
+    <input id="user" placeholder="Username" autocomplete="username">
+    <input id="password" type="password" placeholder="Password" autocomplete="current-password">
+    <button type="submit">Connect</button>
+    <div class="err" id="loginErr"></div>
+  </form>
+</div>
+
+<div id="appView" class="hidden">
+  <header>
+    <span id="who"></span>
+    <label>AF server <select id="afServer"></select></label>
+    <label>Database <select id="database"></select></label>
+    <button id="reload">Reload</button>
+    <span class="spacer"></span>
+    <span id="err"></span>
+    <button id="logout">Disconnect</button>
+  </header>
+  <div id="main">
+    <div id="nav"></div>
+    <div id="detail"><em>Select an element in the tree.</em></div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  if (r.status === 401) { showLogin(); throw new Error("Not signed in"); }
+  if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
+  return r.json();
+}
+
+function showLogin() { $("loginView").classList.remove("hidden"); $("appView").classList.add("hidden"); }
+function showApp() { $("loginView").classList.add("hidden"); $("appView").classList.remove("hidden"); }
+function setErr(e) { $("err").textContent = e ? e.message : ""; }
+
+$("login").addEventListener("submit", async ev => {
+  ev.preventDefault();
+  $("loginErr").textContent = "";
+  const r = await fetch("/api/login", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ host: $("host").value, domain: $("domain").value, user: $("user").value, password: $("password").value })
+  });
+  const body = await r.json();
+  if (!r.ok) { $("loginErr").textContent = body.error || "Login failed"; return; }
+  $("password").value = "";
+  localStorage.setItem("piLogin", JSON.stringify({ host: $("host").value, domain: $("domain").value, user: $("user").value }));
+  $("who").textContent = `${body.user} @ ${body.host}`;
+  showApp();
+  await loadServers();
+});
+
+$("logout").onclick = async () => { await fetch("/api/logout", { method: "POST" }); showLogin(); };
+
+async function loadServers() {
+  setErr();
+  const servers = await api("/api/afservers");
+  $("afServer").innerHTML = servers.map(s => `<option value="${s.webId}">${s.name}</option>`).join("");
+  const preferred = [...$("afServer").options].find(o => o.text.toLowerCase() === $("host").value.toLowerCase());
+  if (preferred) preferred.selected = true;
+  await loadDatabases();
+}
+
+async function loadDatabases() {
+  try {
+    const dbs = await api(`/api/afservers/${$("afServer").value}/databases`);
+    $("database").innerHTML = '<option value="">- select database -</option>' +
+      dbs.map(d => `<option value="${d.webId}">${d.name}</option>`).join("");
+    $("nav").innerHTML = "";
+  } catch (e) { setErr(e); }
+}
+
+async function loadTree() {
+  const db = $("database").value;
+  if (!db) return;
+  setErr();
+  $("nav").innerHTML = "<em>Loading...</em>";
+  try {
+    const tree = await api(`/api/databases/${db}/tree`);
+    $("nav").innerHTML = "";
+    $("nav").appendChild(renderNodes(tree));
+    if (!tree.length) $("nav").innerHTML = "<em>No matching elements.</em>";
+  } catch (e) { $("nav").innerHTML = ""; setErr(e); }
+}
+
+function renderNodes(nodes) {
+  const ul = document.createElement("ul");
+  ul.className = "tree";
+  for (const n of nodes) {
+    const li = document.createElement("li");
+    const hasKids = n.children.length > 0;
+    const row = document.createElement("div");
+    row.className = "node";
+    row.innerHTML = `<span class="twisty">${hasKids ? "\u25B6" : ""}</span><span class="${n.webId ? "leaf" : "folder"}">${n.name}</span>`;
+    li.appendChild(row);
+    let kids = null;
+    row.onclick = () => {
+      if (hasKids) {
+        if (!kids) { kids = renderNodes(n.children); kids.classList.add("hidden"); li.appendChild(kids); }
+        const open = kids.classList.toggle("hidden") === false;
+        row.querySelector(".twisty").textContent = open ? "\u25BC" : "\u25B6";
+      }
+      if (n.webId) {
+        document.querySelectorAll(".node.sel").forEach(x => x.classList.remove("sel"));
+        row.classList.add("sel");
+        showAttributes(n);
+      }
+    };
+    ul.appendChild(li);
+  }
+  return ul;
+}
+
+async function showAttributes(n) {
+  $("detail").innerHTML = `<h3>${n.name}</h3><em>Loading...</em>`;
+  try {
+    const attrs = await api(`/api/elements/${n.webId}/attributes`);
+    const esc = s => (s ?? "").toString().replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+    $("detail").innerHTML = `<h3>${esc(n.name)}</h3><table>` + attrs.map(a =>
+      `<tr><td class="n">${esc(a.name)}</td><td class="v">${esc(a.value)}</td>` +
+      `<td class="u">${esc(a.units)}</td><td class="t">${a.timestamp ? new Date(a.timestamp).toLocaleString() : ""}</td></tr>`
+    ).join("") + "</table>";
+    const dataAttr = attrs.find(a => (a.name || "").toLowerCase() === "data");
+    if (dataAttr) { addWrite(n, dataAttr); addPlot(n); }
+  } catch (e) { $("detail").innerHTML = ""; setErr(e); }
+}
+
+function addWrite(n, attr) {
+  const box = document.createElement("div");
+  box.style.marginTop = "12px";
+  box.innerHTML = `Write value to Data: <input id="writeVal" type="number" step="any" style="padding:3px 6px;width:140px">
+    <button id="writeBtn">Write</button> <span id="writeMsg" style="font-size:12px"></span>`;
+  $("detail").appendChild(box);
+  const info = document.createElement("div");
+  info.style.cssText = "font-size:12px;color:#555;margin-top:6px";
+  box.appendChild(info);
+  fetch(`/api/attributes/${attr.webId}/config`).then(r => r.json()).then(c => {
+    const esc = s => (s ?? "").toString().replace(/[&<>]/g, ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[ch]));
+    info.innerHTML = `Data reference: <b>${esc(c.plugIn)}</b> &nbsp; Config: <code>${esc(c.configString)}</code><br>` +
+      `PI tag: <b>${c.pointPath ? esc(c.pointPath) : "(not resolved" + (c.pointError ? ", " + esc(c.pointError) : "") + ")"}</b>`;
+  }).catch(() => { info.textContent = "Could not load data reference."; });
+  $("writeBtn").onclick = async () => {
+    const msg = $("writeMsg"), val = parseFloat($("writeVal").value);
+    if (Number.isNaN(val)) { msg.style.color = "#c00"; msg.textContent = "Enter a number."; return; }
+    if (!confirm(`Write ${val} to "${n.name}" Data now?`)) return;
+    const r = await fetch(`/api/attributes/${attr.webId}/value`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ value: val })
+    });
+    if (r.ok) { await showAttributes(n); }
+    else { msg.style.color = "#c00"; msg.textContent = `Failed: ${r.status} ${await r.text()}`; }
+  };
+}
+
+function addPlot(n) {
+  const box = document.createElement("div");
+  box.id = "plotBox";
+  box.innerHTML = `<h3>Data trend</h3>
+    <div class="ctl">Start <input id="plotStart" value="*-1h"> End <input id="plotEnd" value="*">
+      <button id="plotBtn">Refresh</button> <span id="plotMsg">PI time syntax, e.g. *-1h, *-8h, *-1d, *</span></div>
+    <svg id="plot"></svg>`;
+  $("detail").appendChild(box);
+  const load = () => loadPlot(n);
+  $("plotBtn").onclick = load;
+  load();
+}
+
+async function loadPlot(n) {
+  const svg = $("plot"), msg = $("plotMsg");
+  msg.textContent = "Loading...";
+  svg.innerHTML = "";
+  try {
+    const q = `start=${encodeURIComponent($("plotStart").value)}&end=${encodeURIComponent($("plotEnd").value)}`;
+    const data = await api(`/api/elements/${n.webId}/plot?${q}`);
+    if (!data.points.length) { msg.textContent = "No data in range."; return; }
+    msg.textContent = `${data.points.length} points`;
+    drawPlot(svg, data.points.map(p => ({ t: new Date(p.t).getTime(), v: p.v })), data.units);
+  } catch (e) { msg.textContent = e.message; }
+}
+
+function drawPlot(svg, pts, units) {
+  const W = svg.clientWidth || 800, H = svg.clientHeight || 260;
+  const m = { l: 60, r: 14, t: 10, b: 28 };
+  const t0 = pts[0].t, t1 = pts[pts.length - 1].t;
+  let lo = Math.min(...pts.map(p => p.v)), hi = Math.max(...pts.map(p => p.v));
+  if (lo === hi) { lo -= 1; hi += 1; }
+  const pad = (hi - lo) * 0.05; lo -= pad; hi += pad;
+  const x = t => m.l + (t1 === t0 ? 0 : (t - t0) / (t1 - t0)) * (W - m.l - m.r);
+  const y = v => H - m.b - (v - lo) / (hi - lo) * (H - m.t - m.b);
+  let s = "";
+  for (let i = 0; i <= 4; i++) {
+    const v = lo + (hi - lo) * i / 4;
+    s += `<line x1="${m.l}" x2="${W - m.r}" y1="${y(v)}" y2="${y(v)}" stroke="#eee"/>` +
+         `<text x="${m.l - 6}" y="${y(v) + 4}" text-anchor="end" font-size="11" fill="#666">${v.toPrecision(3)}</text>`;
+  }
+  for (let i = 0; i <= 4; i++) {
+    const t = t0 + (t1 - t0) * i / 4;
+    s += `<text x="${x(t)}" y="${H - 8}" text-anchor="middle" font-size="11" fill="#666">${new Date(t).toLocaleTimeString()}</text>`;
+  }
+  if (units) s += `<text x="4" y="12" font-size="11" fill="#666">${units}</text>`;
+  s += `<polyline fill="none" stroke="#3d8bd9" stroke-width="1.5" points="${pts.map(p => `${x(p.t)},${y(p.v)}`).join(" ")}"/>`;
+  svg.innerHTML = s;
+}
+
+$("afServer").onchange = loadDatabases;
+$("database").onchange = loadTree;
+$("reload").onclick = loadTree;
+
+// Restore last login fields (never the password) and resume an existing server session.
+try {
+  const saved = JSON.parse(localStorage.getItem("piLogin") || "null");
+  if (saved) { $("host").value = saved.host; $("domain").value = saved.domain; $("user").value = saved.user; }
+} catch { }
+fetch("/api/me").then(async r => {
+  if (!r.ok) return;
+  const me = await r.json();
+  $("who").textContent = `${me.user} @ ${me.host}`;
+  $("host").value = me.host;
+  showApp();
+  await loadServers();
+}).catch(() => { });
+</script>
+</body>
+</html>

@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="ConsoleApp1/PIWebApiConsole.csproj" />
+  <Project Path="PIWebApiWeb/PIWebApiWeb.csproj" />
+</Solution>
