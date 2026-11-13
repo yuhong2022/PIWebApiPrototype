@@ -1,0 +1,33 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Read(./**/.env)",
+      "Read(./**/.env.*)",
+      "Read(./**/*.pem)",
+      "Read(./**/*.key)",
+      "Read(./**/secrets.json)",
+      "Read(./**/appsettings*.Development.json)",
+      "Edit(./.env)",
+      "Edit(./.env.*)",
+      "Edit(./**/.env)",
+      "Edit(./**/.env.*)",
+      "Bash(git push --force:*)",
+      "Bash(git push -f:*)",
+      "Bash(git push * --force:*)",
+      "Bash(git push * -f:*)",
+      "Bash(git push --force-with-lease:*)",
+      "Bash(git reset --hard:*)",
+      "Bash(git clean -fd:*)",
+      "Bash(git clean -fdx:*)",
+      "Bash(git branch -D:*)",
+      "Bash(git update-ref -d:*)",
+      "Bash(gh repo delete:*)",
+      "Bash(gh api -X DELETE:*)",
+      "Bash(gh api --method DELETE:*)",
+      "Bash(rm -rf:*)",
+      "Bash(Remove-Item -Recurse -Force:*)"
+    ]
+  }
+}

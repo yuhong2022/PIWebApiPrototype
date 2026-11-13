@@ -1,0 +1,36 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "build PIWebApiWeb",
+      "type": "process",
+      "command": "dotnet",
+      "args": [
+        "build",
+        "${workspaceFolder}/PIWebApiWeb/PIWebApiWeb.csproj",
+        "/property:GenerateFullPaths=true",
+        "/consoleloggerparameters:NoSummary"
+      ],
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": "$msCompile"
+    },
+    {
+      "label": "watch PIWebApiWeb",
+      "type": "process",
+      "command": "dotnet",
+      "args": [
+        "watch",
+        "run",
+        "--project",
+        "${workspaceFolder}/PIWebApiWeb/PIWebApiWeb.csproj",
+        "--launch-profile",
+        "PIWebApiWeb"
+      ],
+      "options": {
+        "env": { "DOTNET_WATCH_SUPPRESS_LAUNCH_BROWSER": "1" }
+      },
+      "isBackground": true,
+      "problemMatcher": "$msCompile"
+    }
+  ]
+}

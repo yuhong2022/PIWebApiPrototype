@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json.Nodes;
@@ -6,8 +7,36 @@ using System.Text.Json.Nodes;
 var builder = WebApplication.CreateBuilder(args);
 var app = builder.Build();
 
+app.UseExceptionHandler(errorApp =>
+{
+    errorApp.Run(async context =>
+    {
+        var ex = context.Features.Get<Microsoft.AspNetCore.Diagnostics.IExceptionHandlerFeature>()?.Error;
+
+        if (ex is HttpRequestException httpEx)
+        {
+            context.Response.StatusCode = (int?)httpEx.StatusCode ?? StatusCodes.Status502BadGateway;
+            context.Response.ContentType = "application/json";
+            await context.Response.WriteAsJsonAsync(new { error = httpEx.Message });
+            return;
+        }
+
+        context.Response.StatusCode = StatusCodes.Status500InternalServerError;
+        context.Response.ContentType = "application/json";
+        await context.Response.WriteAsJsonAsync(new { error = ex?.Message ?? "Unexpected server error." });
+    });
+});
+
 app.UseDefaultFiles();
-app.UseStaticFiles();
+app.UseStaticFiles(new StaticFileOptions
+{
+    OnPrepareResponse = c =>
+    {
+        c.Context.Response.Headers.CacheControl = "no-store, no-cache, must-revalidate";
+        c.Context.Response.Headers.Pragma = "no-cache";
+        c.Context.Response.Headers.Expires = "0";
+    }
+});
 
 var sessions = new ConcurrentDictionary<string, PiSession>();
 const string CookieName = "pi_sid";
@@ -80,6 +109,163 @@ app.MapGet("/api/afservers/{webId}/databases", async (string webId, HttpContext 
     return Results.Json(doc["Items"]!.AsArray().Select(i => new { name = (string?)i!["Name"], webId = (string?)i["WebId"] }));
 });
 
+app.MapPost("/api/afservers/{webId}/databases", async (string webId, CreateDatabaseRequest req, HttpContext ctx) =>
+{
+    var s = GetSession(ctx);
+    if (s is null) return Results.Unauthorized();
+
+    var name = (req.Name ?? "").Trim();
+    if (string.IsNullOrWhiteSpace(name))
+        return Results.BadRequest(new { error = "Database name is required." });
+
+    var existing = await s.GetAsync($"assetservers/{webId}/assetdatabases?selectedFields=Items.Name");
+    var exists = existing["Items"]!.AsArray().Any(i => string.Equals((string?)i!["Name"], name, StringComparison.OrdinalIgnoreCase));
+    if (exists)
+        return Results.Json(new { error = $"Database '{name}' already exists." }, statusCode: 409);
+
+    var body = new JsonObject { ["Name"] = name };
+    using var response = await s.Client.PostAsync($"assetservers/{webId}/assetdatabases",
+        new StringContent(body.ToJsonString(), Encoding.UTF8, "application/json"));
+
+    if (!response.IsSuccessStatusCode)
+        return Results.Json(new { error = $"{(int)response.StatusCode} {await response.Content.ReadAsStringAsync()}" }, statusCode: (int)response.StatusCode);
+
+    return Results.Ok(new { name });
+});
+
+async Task<IResult> ImportAfTemplateAsync(string webId, HttpRequest request, HttpContext ctx)
+{
+    var s = GetSession(ctx);
+    if (s is null) return Results.Unauthorized();
+
+    if (!request.HasFormContentType)
+        return Results.BadRequest(new { error = "Expected multipart/form-data." });
+
+    var form = await request.ReadFormAsync();
+    var file = form.Files.GetFile("file");
+    if (file is null || file.Length == 0)
+        return Results.BadRequest(new { error = "AF template XML file is required." });
+
+    // Support both encoded and catch-all route values.
+    webId = Uri.UnescapeDataString(webId).Trim('/');
+
+    // PI Web API 2023 SP1+ no longer offers POST assetdatabases/{webId}/import, so we import with
+    // AFImport.exe (ships with PI AF Client). We still use PI Web API to resolve the DB's AF path.
+    string? dbPath;
+    try
+    {
+        dbPath = (string?)(await s.GetAsync($"assetdatabases/{webId}?selectedFields=Path"))["Path"];
+    }
+    catch (HttpRequestException ex) when ((int?)ex.StatusCode == 404)
+    {
+        return Results.Json(new
+        {
+            error = "Database WebId was not found on PI Web API server.",
+            webId,
+            hint = "Refresh database list and select the database again."
+        }, statusCode: 404);
+    }
+    if (string.IsNullOrWhiteSpace(dbPath))
+        return Results.Json(new { error = "PI Web API did not return a path for this database." }, statusCode: 502);
+
+    var exePath = FindAfImportExe();
+    if (exePath is null)
+        return Results.Json(new
+        {
+            error = "AFImport.exe was not found. Install PI AF Client on the machine running this app, or set AfImport:ExePath."
+        }, statusCode: StatusCodes.Status501NotImplemented);
+
+    var tempFile = Path.Combine(Path.GetTempPath(), $"afimport_{Guid.NewGuid():N}.xml");
+    try
+    {
+        await using (var fs = File.Create(tempFile))
+            await file.CopyToAsync(fs);
+
+        var psi = new ProcessStartInfo(exePath)
+        {
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+        };
+        psi.ArgumentList.Add(dbPath);              // e.g. \\KYBELE\APITEST1
+        psi.ArgumentList.Add($"/File:{tempFile}");
+        foreach (var a in (app.Configuration["AfImport:ExtraArgs"] ?? "").Split(' ', StringSplitOptions.RemoveEmptyEntries))
+            psi.ArgumentList.Add(a);               // e.g. "/P" to create/update PI points
+
+        var timeout = TimeSpan.FromSeconds(app.Configuration.GetValue("AfImport:TimeoutSeconds", 300));
+        using var proc = Process.Start(psi)!;
+        var stdoutTask = proc.StandardOutput.ReadToEndAsync();
+        var stderrTask = proc.StandardError.ReadToEndAsync();
+
+        using var cts = new CancellationTokenSource(timeout);
+        try { await proc.WaitForExitAsync(cts.Token); }
+        catch (OperationCanceledException)
+        {
+            try { proc.Kill(entireProcessTree: true); } catch { }
+            return Results.Json(new { error = $"AFImport timed out after {timeout.TotalSeconds:0} s." }, statusCode: 504);
+        }
+
+        var output = ((await stdoutTask) + "\n" + (await stderrTask)).Trim();
+        app.Logger.LogInformation("AFImport {Db} exit {Code}: {Output}", dbPath, proc.ExitCode, output);
+
+        if (proc.ExitCode != 0)
+            return Results.Json(new
+            {
+                error = $"AFImport failed (exit {proc.ExitCode}) for {dbPath}: {(output.Length > 0 ? output : "(no output)")}",
+                exitCode = proc.ExitCode,
+            }, statusCode: StatusCodes.Status502BadGateway);
+
+        return Results.Ok(new { message = "AF template imported successfully.", database = dbPath, importedFile = file.FileName, details = output });
+    }
+    finally
+    {
+        try { File.Delete(tempFile); } catch { }
+    }
+}
+
+string? FindAfImportExe()
+{
+    var configured = app.Configuration["AfImport:ExePath"];
+    if (!string.IsNullOrWhiteSpace(configured))
+        return File.Exists(configured) ? configured : null;
+
+    var candidates = new[]
+    {
+        Environment.GetEnvironmentVariable("PIHOME64"),
+        Environment.GetEnvironmentVariable("PIHOME"),
+        @"C:\Program Files\PIPC",
+    };
+    return candidates
+        .Where(d => !string.IsNullOrWhiteSpace(d))
+        .Select(d => Path.Combine(d!, "AF", "AFImport.exe"))
+        .FirstOrDefault(File.Exists);
+}
+
+app.MapPost("/api/databases/{webId}/import", ImportAfTemplateAsync);
+
+// Helpful response if client accidentally uses GET.
+app.MapGet("/api/databases/{webId}/import", (string webId) =>
+    Results.Json(new
+    {
+        error = "Use POST multipart/form-data to import AF template XML.",
+        webId
+    }, statusCode: StatusCodes.Status405MethodNotAllowed));
+
+// Fallback for clients that send slash-containing IDs that bypass normal segment matching.
+app.MapPost("/api/databases/{*route}", async (string route, HttpRequest request, HttpContext ctx) =>
+{
+    const string suffix = "/import";
+    if (!route.EndsWith(suffix, StringComparison.OrdinalIgnoreCase))
+        return Results.NotFound();
+
+    var webId = route[..^suffix.Length];
+    if (string.IsNullOrWhiteSpace(webId))
+        return Results.BadRequest(new { error = "Database WebId is required." });
+
+    return await ImportAfTemplateAsync(webId, request, ctx);
+});
+
 // Tree containing only elements of the given templates and their ancestors.
 app.MapGet("/api/databases/{webId}/tree", async (string webId, string? templates, HttpContext ctx) =>
 {
@@ -92,8 +278,19 @@ app.MapGet("/api/databases/{webId}/tree", async (string webId, string? templates
     var root = new TreeNode("");
     foreach (var t in templateList)
     {
-        var doc = await s.GetAsync(
-            $"assetdatabases/{webId}/elements?searchFullHierarchy=true&templateName={Uri.EscapeDataString(t)}&maxCount=1000&selectedFields=Items.Path;Items.WebId");
+        var selectedFields = Uri.EscapeDataString("Items.Path;Items.WebId");
+        JsonNode? doc;
+        try
+        {
+            doc = await s.GetAsync(
+                $"assetdatabases/{webId}/elements?searchFullHierarchy=true&templateName={Uri.EscapeDataString(t)}&maxCount=1000&selectedFields={selectedFields}");
+        }
+        catch (HttpRequestException ex)
+            when ((int?)ex.StatusCode == 400 && ex.Message.Contains("element template was not found", StringComparison.OrdinalIgnoreCase))
+        {
+            // New/empty DB: template does not exist yet. Skip and continue.
+            continue;
+        }
         foreach (var item in doc["Items"]!.AsArray())
         {
             var node = root;
@@ -217,6 +414,7 @@ async Task<(string? WebId, string? Path, string? Error)> ResolvePointAsync(PiSes
 }
 
 record WriteRequest(double Value);
+record CreateDatabaseRequest(string? Name);
 
 record LoginRequest(string? Host, string? Domain, string User, string Password);
 
@@ -229,8 +427,15 @@ class PiSession(HttpClient client, string user, string host)
     public async Task<JsonNode> GetAsync(string path)
     {
         using var response = await Client.GetAsync(path);
-        response.EnsureSuccessStatusCode();
-        return (await JsonNode.ParseAsync(await response.Content.ReadAsStreamAsync()))!;
+        var body = await response.Content.ReadAsStringAsync();
+
+        if (!response.IsSuccessStatusCode)
+            throw new HttpRequestException(
+                $"GET {path} failed: {(int)response.StatusCode} {response.ReasonPhrase}. Body: {body}",
+                null,
+                response.StatusCode);
+
+        return JsonNode.Parse(body)!;
     }
 }
 

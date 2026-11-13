@@ -1,0 +1,20 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "PIWebApiWeb",
+      "type": "coreclr",
+      "request": "launch",
+      "preLaunchTask": "build PIWebApiWeb",
+      "program": "${workspaceFolder}/PIWebApiWeb/bin/Debug/net10.0/PIWebApiWeb.dll",
+      "args": [],
+      "cwd": "${workspaceFolder}/PIWebApiWeb",
+      "stopAtEntry": false,
+      "env": {
+        "ASPNETCORE_ENVIRONMENT": "Development",
+        "ASPNETCORE_URLS": "https://localhost:58204;http://localhost:58205"
+      },
+      "console": "internalConsole"
+    }
+  ]
+}

@@ -6,11 +6,13 @@
 <style>
   body { font-family: Segoe UI, Arial, sans-serif; margin: 0; font-size: 14px; color: #222; }
   header { background: #2b3a4a; color: #fff; padding: 8px 14px; display: flex; gap: 12px; align-items: center; }
-  header select, header button { padding: 3px 6px; }
+  header select, header button, header input { padding: 3px 6px; }
   header .spacer { flex: 1; }
   #login { max-width: 320px; margin: 80px auto; display: grid; gap: 8px; }
   #login input, #login button { padding: 6px; }
   #login .err, #err { color: #c00; }
+  #opmsg { color: #b9efb9; font-size: 12px; }
+  #ver { color: #cfe4ff; border: 1px solid #5f7d99; border-radius: 10px; padding: 1px 8px; font-size: 12px; }
   #main { display: flex; height: calc(100vh - 42px); }
   #nav { width: 340px; min-width: 200px; overflow: auto; border-right: 1px solid #ccc; padding: 6px; resize: horizontal; }
   #detail { flex: 1; overflow: auto; padding: 10px 16px; }
@@ -53,10 +55,16 @@
 <div id="appView" class="hidden">
   <header>
     <span id="who"></span>
+    <span id="ver">UI v2</span>
     <label>AF server <select id="afServer"></select></label>
+    <input id="newDbName" placeholder="New database name">
+    <button id="createDb">Create DB</button>
     <label>Database <select id="database"></select></label>
+    <input id="xmlFile" type="file" accept=".xml,text/xml,application/xml">
+    <button id="importXmlBtn">Import XML</button>
     <button id="reload">Reload</button>
     <span class="spacer"></span>
+    <span id="opmsg"></span>
     <span id="err"></span>
     <button id="logout">Disconnect</button>
   </header>
@@ -78,7 +86,12 @@ async function api(path, opts) {
 
 function showLogin() { $("loginView").classList.remove("hidden"); $("appView").classList.add("hidden"); }
 function showApp() { $("loginView").classList.add("hidden"); $("appView").classList.remove("hidden"); }
-function setErr(e) { $("err").textContent = e ? e.message : ""; }
+function setErr(e) { $("err").textContent = e ? e.message : ""; if (e) setMsg(""); }
+function setMsg(message) { $("opmsg").textContent = message || ""; }
+async function readError(r) {
+  try { const b = await r.json(); return b.error || JSON.stringify(b); }
+  catch { return await r.text(); }
+}
 
 $("login").addEventListener("submit", async ev => {
   ev.preventDefault();
@@ -127,6 +140,48 @@ async function loadTree() {
     $("nav").appendChild(renderNodes(tree));
     if (!tree.length) $("nav").innerHTML = "<em>No matching elements.</em>";
   } catch (e) { $("nav").innerHTML = ""; setErr(e); }
+}
+
+async function createDatabase() {
+  setErr();
+  setMsg("");
+  const serverWebId = $("afServer").value;
+  const name = $("newDbName").value.trim();
+  if (!serverWebId) { setErr(new Error("Select an AF server first.")); return; }
+  if (!name) { setErr(new Error("Enter a database name.")); return; }
+
+  const r = await fetch(`/api/afservers/${serverWebId}/databases`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name })
+  });
+
+  if (!r.ok) { setErr(new Error(await readError(r))); return; }
+
+  $("newDbName").value = "";
+  await loadDatabases();
+  const created = [...$("database").options].find(o => o.text.toLowerCase() === name.toLowerCase());
+  if (created) { created.selected = true; await loadTree(); }
+  setMsg(`Database '${name}' created.`);
+}
+
+async function importXml() {
+  setErr();
+  setMsg("");
+  const dbWebId = $("database").value;
+  const file = $("xmlFile").files[0];
+  if (!dbWebId) { setErr(new Error("Select a database first.")); return; }
+  if (!file) { setErr(new Error("Choose an XML file.")); return; }
+
+  const form = new FormData();
+  form.append("file", file);
+
+  const r = await fetch(`/api/databases/${dbWebId}/import`, { method: "POST", body: form });
+  if (!r.ok) { setErr(new Error(await readError(r))); return; }
+
+  $("xmlFile").value = "";
+  await loadTree();
+  setMsg(`Imported '${file.name}'.`);
 }
 
 function renderNodes(nodes) {
@@ -250,6 +305,8 @@ function drawPlot(svg, pts, units) {
 $("afServer").onchange = loadDatabases;
 $("database").onchange = loadTree;
 $("reload").onclick = loadTree;
+$("createDb").onclick = createDatabase;
+$("importXmlBtn").onclick = importXml;
 
 // Restore last login fields (never the password) and resume an existing server session.
 try {
